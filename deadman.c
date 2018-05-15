@@ -6,6 +6,10 @@
 #include <linux/ioctl.h>
 #include <linux/kd.h>
 #include <linux/fs.h>
+#include <linux/netfilter.h>
+#include <linux/netfilter_ipv4.h>
+#include <linux/icmp.h>
+#include <linux/ip.h>
 
 MODULE_LICENSE("GPL"); // Not a fan, but required to get some symbols :(
 MODULE_AUTHOR("Hendrik 'T4cC0re' Meyer");
@@ -15,7 +19,7 @@ MODULE_VERSION("0.1");
 static char *host = "";
 static short maxfail = 24;
 static short maxUnresponsiveSecs = 30;
-static short preventunload = 1;
+static short preventunload = 0;
 
 module_param(host, charp, S_IRUGO); // charp = char ptr, S_IRUGO = RO
 module_param(maxfail, short, S_IRUGO);
@@ -25,8 +29,13 @@ module_param(preventunload, short, S_IRUGO);
 MODULE_PARM_DESC(host, "host to ping periodically (empty to disable, default)");
 MODULE_PARM_DESC(maxfail, "Maximum amount of failure conditions (default 24 = ~120 sec.)");
 MODULE_PARM_DESC(maxUnresponsiveSecs, "Maximum time the system can spend without interacting with deadman (e.g. sleep) (default: 30 sec.)");
-MODULE_PARM_DESC(preventunload, "Set to 1 or 0 to enable or disable auto-kill on unload. (default: 1)");
+MODULE_PARM_DESC(preventunload, "Set to 1 or 0 to enable or disable auto-kill on unload. (default: 0)");
 
+static struct nf_hook_ops nfho;
+
+unsigned long long now = 0;
+unsigned long long lastHeartbeat = 0;;
+unsigned long long heartbeatTolerance = 0;
 static char *envp[] = {
   "HOME=/",
   "TERM=linux",
@@ -75,10 +84,6 @@ bool beep(int freq, int duration, int delay, uint repetetions) {
   filp_close(console_fd,0);
   return false;
 }
-
-unsigned long long now = 0;
-unsigned long long lastHeartbeat = 0;;
-unsigned long long heartbeatTolerance = 0;
 
 /**
  * Resets the heartbeat evaluated by wasUnresponsive(). Use with caution!
@@ -194,11 +199,45 @@ int thread(void *unused) {
   return 0;
 }
 
+
+static void printICMPHeader(struct icmphdr *icmph)
+{
+    printk(KERN_INFO "ICMP print function begin \n");
+    printk(KERN_INFO "ICMP type = %d\n", icmph->type);
+    printk(KERN_INFO "ICMP code = %d\n", icmph->code);
+    printk(KERN_INFO "ICMP checksum = %d\n", icmph->checksum);
+    printk(KERN_INFO "ICMP id = %d\n", icmph->un.echo.id);
+    printk(KERN_INFO "ICMP sequence = %d\n", icmph->un.echo.sequence);
+    printk(KERN_INFO "ICMP print function exit \n");
+}
+
+static unsigned int icmp_check(void * unused,
+                   struct sk_buff *skb,
+                   const struct nf_hook_state* unused2)
+{
+    struct iphdr *iph;
+    struct icmphdr *icmph;
+    struct tcphdr *tcph;
+
+    if(skb == NULL)
+        return -1;
+    iph = ip_hdr(skb);
+    if(iph->protocol == IPPROTO_ICMP){
+        printk(KERN_DEBUG "ICMP traffic!\n");
+        icmph = icmp_hdr(skb);
+        printICMPHeader(icmph);
+//        return NF_STOLEN;
+    }/* If IPPROTO_ICMP */
+    return NF_ACCEPT;
+}
+
+
 static int __init init(void){
+  int ok = 0;
   printk(KERN_INFO "deadman: Init\n");
 
   if (maxUnresponsiveSecs <= 5) {
-    printk(KERN_INFO, "deadman: maxUnresponsiveSecs has to be greater than 5! Setting it to 6.");
+    printk(KERN_INFO "deadman: maxUnresponsiveSecs has to be greater than 5! Setting it to 6.");
     maxUnresponsiveSecs = 6;
   }
   heartbeatTolerance = maxUnresponsiveSecs;
@@ -211,6 +250,18 @@ static int __init init(void){
 
   deadcounter = maxfail;
 
+  nfho.hook     = icmp_check;         /* Handler function */
+  nfho.hooknum  = NF_INET_PRE_ROUTING; /* Just before it hits the wire */
+  nfho.pf       = PF_INET;
+  nfho.priority = NF_IP_PRI_FILTER;
+
+  // init_net comes from /net/core/net_namepsace.c
+  ok = nf_register_net_hook(&init_net, &nfho);
+  if (ok < 0) {
+    printk(KERN_INFO "deadman: nf_register_net_hook() failed with %d\n", ok);
+    return ok;
+  }
+
   task = kthread_run(&thread, 0, "deadmand");
 
   return 0;
@@ -218,6 +269,7 @@ static int __init init(void){
 
 static void __exit cleanup(void){
 printk(KERN_INFO "deadman: Asked to unload. Cleaning up...\n");
+  nf_unregister_net_hook(&init_net, &nfho);
   if (task != NULL) {
     kthread_stop(task);
   }
